@@ -2,5 +2,6 @@ numpy==2.5.3
 scipy==1.18.1
 matplotlib==3.11.2
 soundfile==0.13.1
+sounddevice==0.5.6
 jupyter==1.1.1
 ipykernel==7.3.0

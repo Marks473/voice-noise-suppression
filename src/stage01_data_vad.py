@@ -10,7 +10,7 @@ import numpy as np
 import scipy.signal as sps
 import soundfile as sf
 
-SAMPLERATE = 16000*2
+SAMPLERATE = 16000
 EPS = 1e-12
 
 

@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import scipy.signal as sps
 import soundfile as sf
 
 SAMPLERATE = 16000
@@ -39,47 +38,67 @@ def load_or_record_speech(path: Path, duration_s: float = 6.0, samplerate: int =
 
 
 def _normalize_rms(x: np.ndarray) -> np.ndarray:
+    """Приводит сигнал к единичной среднеквадратичной мощности: x / RMS(x), где
+    RMS(x) = sqrt(mean(x**2)). После этого мощность сигнала равна ровно 1, и его
+    дальше можно предсказуемо смешивать с другими сигналами произвольной исходной
+    громкости — см. mix().
+    """
     rms = np.sqrt(np.mean(x**2) + EPS)
     return x / rms
 
 
 def synth_factory_noise(duration_s: float, samplerate: int = SAMPLERATE, seed: int | None = 0) -> np.ndarray:
-    """Синтетический шум завода: гармоники двигателей + гул + случайные импульсы."""
+    """Синтетический шум завода = гул моторов + широкополосный шум.
+
+    Модель — сумма двух слагаемых, каждое приведено к единичной мощности и взято
+    с своим весом:
+
+        w(t) = 0.6 * (гул) + 0.4 * (широкополосный шум)
+
+    Гул — это сумма нескольких гармоник основной частоты f0 (кратные частоты
+    f0, 2f0, 3f0, ... возникают из-за периодического вращения вала двигателя или
+    вентилятора; чем выше гармоника, тем меньше её амплитуда — так задан список
+    [1.0, 0.6, 0.35, 0.2]). Широкополосный шум — обычный белый гауссовский шум
+    (независимые нормальные случайные числа), он моделирует всё остальное:
+    трение, вибрацию корпуса, электрические наводки — то, что не сводится к
+    чистым тонам.
+    """
     rng = np.random.default_rng(seed)
     n = int(duration_s * samplerate)
     t = np.arange(n) / samplerate
 
-    base_freq = 90.0
-    harmonics = np.zeros(n)
+    base_freq = 90.0  # Гц — основная частота гула
+    hum = np.zeros(n)
     for k, amp in enumerate([1.0, 0.6, 0.35, 0.2], start=1):
-        phase = rng.uniform(0, 2 * np.pi)
-        harmonics += amp * np.sin(2 * np.pi * k * base_freq * t + phase)
+        hum += amp * np.sin(2 * np.pi * k * base_freq * t)
 
     white = rng.standard_normal(n)
-    alpha = 0.05
-    broadband = sps.lfilter([alpha], [1, -(1 - alpha)], white)
 
-    impulses = np.zeros(n)
-    rate_hz = 0.7
-    t_event = 0.0
-    while True:
-        t_event += rng.exponential(1.0 / rate_hz)
-        if t_event >= duration_s:
-            break
-        idx = int(t_event * samplerate)
-        decay_len = int(0.02 * samplerate)
-        decay = np.exp(-np.arange(decay_len) / (0.003 * samplerate))
-        amp = rng.uniform(1.5, 3.0)
-        end = min(n, idx + decay_len)
-        impulses[idx:end] += amp * decay[: end - idx]
-
-    noise = 0.5 * _normalize_rms(harmonics) + 0.7 * _normalize_rms(broadband) + 0.3 * impulses
+    noise = 0.6 * _normalize_rms(hum) + 0.4 * _normalize_rms(white)
     return _normalize_rms(noise)
 
 
 def mix(speech: np.ndarray, noise: np.ndarray, snr_db: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Смешивает речь и шум с заданным ОСШ (дБ). Возвращает (смесь, речь, шум) — согласованно
-    отмасштабированные, если потребовалась защита от клиппинга."""
+    """Смешивает речь и шум так, чтобы у смеси было ровно заданное ОСШ snr_db (дБ).
+
+    Мощность сигнала — среднее значение его квадрата: P = mean(x**2). ОСШ по
+    определению — это P_речь / P_шум, выраженное в децибелах:
+
+        ОСШ(дБ) = 10 * log10(P_речь / P_шум).
+
+    Готового шума с нужной мощностью у нас нет — есть некоторый noise с мощностью
+    P_шум, и его нужно умножить на коэффициент k так, чтобы получить целевое ОСШ.
+    Так как мощность растёт с КВАДРАТОМ амплитуды, после умножения на k мощность
+    шума станет k**2 * P_шум. Подставляем это в определение ОСШ и решаем относительно k:
+
+        snr_db = 10 * log10(P_речь / (k**2 * P_шум))
+        10**(snr_db/10) = P_речь / (k**2 * P_шум)
+        k**2 = P_речь / (P_шум * 10**(snr_db/10))
+        k = sqrt(P_речь / (P_шум * 10**(snr_db/10)))
+
+    Именно эта формула — ниже. Возвращает (смесь, речь, шум) — согласованно
+    отмасштабированные, если потребовалась защита от клиппинга.
+    """
     n = len(speech)
     reps = int(np.ceil(n / len(noise)))
     noise_full = np.tile(noise, reps)[:n]
@@ -99,6 +118,12 @@ def mix(speech: np.ndarray, noise: np.ndarray, snr_db: float) -> tuple[np.ndarra
 
 
 def _frame_signal(signal: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
+    """Режет сигнал на короткие перекрывающиеся окна (кадры) по frame_len отсчётов
+    со сдвигом hop_len между соседними кадрами. Это и есть операция "framing" —
+    основа всех кратковременных оценок ниже (ОСШ, энергия для VAD): вместо одного
+    числа на весь сигнал считаем его отдельно в каждом маленьком окне, чтобы видеть,
+    как характеристика сигнала меняется во времени.
+    """
     n_frames = max(1, 1 + (len(signal) - frame_len) // hop_len)
     frames = np.zeros((n_frames, frame_len))
     for i in range(n_frames):
@@ -110,7 +135,15 @@ def _frame_signal(signal: np.ndarray, frame_len: int, hop_len: int) -> np.ndarra
 def estimate_windowed_snr(
     speech: np.ndarray, noise: np.ndarray, samplerate: int = SAMPLERATE, win_ms: float = 32.0, hop_ms: float = 16.0
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Кратковременная оценка ОСШ (дБ) по окнам. Возвращает (время центров окон, ОСШ)."""
+    """Кратковременное (покадровое) ОСШ — то же самое определение ОСШ, что и в
+    mix() (10 * log10(P_речь / P_шум)), но посчитанное отдельно в каждом коротком
+    окне длиной win_ms, а не для всей записи разом.
+
+    Одно число ОСШ на всю запись слишком грубое: пока говорят — одно соотношение
+    мощностей, в паузе — совсем другое (речи там нет вообще, остаётся только шум,
+    и локальное ОСШ проваливается вниз). Разбиение на кадры (framing) позволяет
+    увидеть эту динамику и служит основой для VAD ниже. Возвращает (время центров
+    окон, ОСШ)."""
     frame_len = int(win_ms / 1000 * samplerate)
     hop_len = int(hop_ms / 1000 * samplerate)
     speech_frames = _frame_signal(speech, frame_len, hop_len)
@@ -132,7 +165,21 @@ def energy_vad(
     threshold_offset_db: float = 6.0,
     floor_percentile: float = 10.0,
 ) -> list[dict]:
-    """Энергетический VAD с фиксированным порогом. Возвращает таймлайн [{start, end, label}]."""
+    """Энергетический детектор речевой активности (Voice Activity Detection).
+
+    Идея простая: пока говорят, энергия кадра заметно выше, чем в паузе, где
+    остаётся только фоновый шум. Порог строится в два шага:
+
+        1. noise_floor_db — floor_percentile-й процентиль энергии по всей записи,
+           то есть уровень, ниже которого лежат самые тихие floor_percentile%
+           кадров. Если пауз в записи заметно больше, чем активной речи, это
+           разумная оценка "типичного уровня тишины", не требующая знать шум заранее.
+        2. threshold_db = noise_floor_db + threshold_offset_db — к полу добавлен
+           запас в decibel'ах, чтобы обычные колебания шума не принимались за речь.
+
+    Кадр помечается как "speech", если его энергия (в дБ) выше threshold_db, и как
+    "silence" иначе. Соседние кадры с одинаковой меткой объединяются в один
+    сегмент. Возвращает таймлайн [{start, end, label}]."""
     frame_len = int(win_ms / 1000 * samplerate)
     hop_len = int(hop_ms / 1000 * samplerate)
     frames = _frame_signal(signal, frame_len, hop_len)
